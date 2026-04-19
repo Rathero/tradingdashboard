@@ -25,8 +25,11 @@ if not exist ".venv" (
 echo [INFO] Activando entorno virtual...
 call .venv\Scripts\activate.bat
 
-echo [INFO] Instalando dependencias...
-pip install -r requirements.txt -q
+echo [INFO] Actualizando pip...
+python -m pip install --upgrade pip
+
+echo [INFO] Instalando dependencias (esto puede tardar unos minutos)...
+pip install -r requirements.txt
 
 REM Copiar .env si no existe
 if not exist ".env" (
@@ -45,6 +48,7 @@ echo [INFO] API Docs:  http://localhost:8000/docs
 echo [INFO] Presiona Ctrl+C para detener
 echo.
 
-python main.py
+REM Usar el python del entorno virtual directamente para evitar conflictos
+.venv\Scripts\python.exe main.py
 
 pause

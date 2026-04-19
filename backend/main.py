@@ -216,7 +216,6 @@ async def index():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = None):
     # En producción usaríamos el token para autenticar
-    await websocket.accept()
     # Mock user_id 1 por ahora para pruebas de frontend iniciales
     uid = 1 
     await manager.connect(uid, websocket)
