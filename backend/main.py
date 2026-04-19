@@ -1,31 +1,28 @@
-"""
-FastAPI Server principal:
-- Webhook para recibir señales de TradingView
-- REST API para el dashboard
-- WebSocket para actualizaciones en tiempo real
-"""
 import asyncio
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, date
-from typing import List
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Any, Optional
 
 import uvicorn
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel
 
 import config
 import database as db
-from ibkr_client import ibkr
-from order_manager import order_manager
-from risk_manager import risk_manager
+from core.auth import get_password_hash, verify_password, create_access_token, get_current_user
+from core.session_manager import session_manager
 from signal_processor import parse_signal
-from notifier import notifier
+from order_manager import OrderManager
+from risk_manager import RiskManager
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,529 +31,200 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
-
-# Silenciar los logs de nivel INFO de ib_insync ("Warning 10167" se registra como INFO allí)
 logging.getLogger("ib_insync").setLevel(logging.WARNING)
-logging.getLogger("ib_insync.wrapper").setLevel(logging.ERROR)
 
+# ─── Models ────────────────────────────────────────────────────────────────────
+class UserRegister(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 # ─── WebSocket Manager ─────────────────────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        # user_id -> List[WebSocket]
+        self.active_connections: Dict[int, List[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        if user_id not in self.active_connections:
+            self.active_connections[user_id] = []
+        self.active_connections[user_id].append(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, user_id: int, websocket: WebSocket):
+        if user_id in self.active_connections:
+            if websocket in self.active_connections[user_id]:
+                self.active_connections[user_id].remove(websocket)
 
-    async def broadcast(self, data: dict):
+    async def send_to_user(self, user_id: int, data: dict):
+        if user_id not in self.active_connections:
+            return
         msg = json.dumps(data)
-        dead = []
-        for ws in self.active_connections:
+        for ws in self.active_connections[user_id]:
             try:
                 await ws.send_text(msg)
             except:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
-
+                pass
 
 manager = ConnectionManager()
 
-
-# ─── Background tasks ──────────────────────────────────────────────────────────
+# ─── Background Tasks ──────────────────────────────────────────────────────────
 async def push_live_updates():
-    """Envía actualizaciones en tiempo real al dashboard cada 3 segundos."""
+    """Actualiza datos para todos los usuarios activos cada 5 segundos."""
     while True:
-        await asyncio.sleep(3)
-        try:
-            if not manager.active_connections:
-                continue
+        await asyncio.sleep(5)
+        users = db.get_active_users()
+        for user in users:
+            uid = user['id']
+            try:
+                broker = await session_manager.get_broker(uid)
+                if not broker or not broker.is_connected(): continue
 
-            account = await ibkr.get_account_summary() if ibkr.is_connected() else {}
-            positions = await ibkr.get_positions() if ibkr.is_connected() else []
+                acc = await broker.get_account_summary()
+                pos = await broker.get_positions()
+                
+                # Sincronizar P&L en BD (Simplificado)
+                today = date.today().isoformat()
+                db.upsert_daily_pnl(uid, today, acc.get("realized_pnl", 0), acc.get("unrealized_pnl", 0), 0, 0)
 
-            # Actualizar P&L diario en BD
-            today_str = date.today().isoformat()
-            closed_today = db.get_trades(status="closed")
-            today_pnl = sum(t.get("realized_pnl", 0) or 0 for t in closed_today
-                            if t.get("closed_at", "").startswith(today_str))
-            unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+                await manager.send_to_user(uid, {
+                    "type": "live_update",
+                    "account": acc,
+                    "positions": pos,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            except Exception as e:
+                logger.debug(f"Error update usuario {uid}: {e}")
 
-            db.upsert_daily_pnl(
-                date=today_str,
-                realized_pnl=today_pnl,
-                unrealized_pnl=unrealized,
-                total=risk_manager._daily_trades,
-                winning=risk_manager._winning_trades,
-            )
-
-            await manager.broadcast({
-                "type": "live_update",
-                "timestamp": datetime.utcnow().isoformat(),
-                "ibkr_connected": ibkr.is_connected(),
-                "account": account,
-                "positions": positions,
-                "daily_stats": risk_manager.daily_stats,
-            })
-        except Exception as e:
-            logger.debug(f"Error en push_live_updates: {e}")
-
-
-# ─── Sincronizar posiciones IBKR → BD ─────────────────────────────────────────
-async def sync_ibkr_positions_to_db() -> int:
-    """
-    Importa las posiciones abiertas en IBKR a la tabla 'trades' local
-    como registros con status='open', evitando duplicados por ibkr_order_id o símbolo.
-    Devuelve el número de posiciones importadas.
-    """
-    if not ibkr.is_connected():
-        return 0
-    try:
-        positions = await ibkr.get_positions()
-        existing = {t["symbol"]: t for t in db.get_trades(status="open")}
-        imported = 0
-        for pos in positions:
-            sym = pos["symbol"]
-            if sym in existing:
-                continue  # ya registrado
-            db.save_trade(
-                symbol=sym,
-                side=pos["side"],
-                qty=pos["qty"],
-                entry_price=pos["avg_cost"],
-                stop_loss=None,
-                take_profit=None,
-                ibkr_order_id=None,
-            )
-            imported += 1
-            logger.info(f"📥 Posición importada de IBKR → BD: {pos['side']} {pos['qty']} {sym} @ {pos['avg_cost']}")
-        if imported:
-            logger.info(f"✅ {imported} posición(es) sincronizadas desde IBKR")
-        return imported
-    except Exception as e:
-        logger.error(f"Error sincronizando posiciones IBKR: {e}")
-        return 0
-
-
-# ─── App Lifecycle ─────────────────────────────────────────────────────────────
+# ─── Lifecycle ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Iniciando Trading Bot...")
     db.init_db()
-
-    # Conectar a IBKR
-    connected = await ibkr.connect()
-    if connected:
-        logger.info("✅ IBKR conectado")
-        # Importar posiciones existentes que no estén ya en la BD
-        await sync_ibkr_positions_to_db()
-    else:
-        logger.warning("⚠️ IBKR no disponible - arranca en modo desconectado")
-
-    # Iniciar actualizaciones en tiempo real y polling de Telegram
-    updates_task = asyncio.create_task(push_live_updates())
-    telegram_task = asyncio.create_task(telegram_polling())
-
+    task = asyncio.create_task(push_live_updates())
     yield
+    task.cancel()
+    await session_manager.close_all()
 
-    updates_task.cancel()
-    telegram_task.cancel()
-    ibkr.disconnect()
-    logger.info("👋 Bot detenido")
+app = FastAPI(title="Trading SaaS API", version="2.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ─── Auth Endpoints ────────────────────────────────────────────────────────────
+@app.post("/auth/register")
+async def register(user_data: UserRegister):
+    if db.get_user_by_username(user_data.username):
+        raise HTTPException(status_code=400, detail="El usuario ya existe")
+    
+    secret = str(uuid.uuid4())[:18]
+    uid = db.create_user(
+        username=user_data.username,
+        password_hash=get_password_hash(user_data.password),
+        webhook_secret=secret
+    )
+    return {"message": "Usuario creado", "webhook_secret": secret}
 
-# ─── FastAPI App ───────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Trading Bot API",
-    description="Bot de trading automático TradingView + Interactive Brokers",
-    version="1.0.0",
-    lifespan=lifespan
-)
+@app.post("/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = db.get_user_by_username(form_data.username)
+    if not user or not verify_password(form_data.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+    
+    access_token = create_access_token(data={"sub": user["username"]})
+    return {"access_token": access_token, "token_type": "bearer"}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Servir el frontend — montamos /css y /js directamente para que el HTML los encuentre
-frontend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
-if os.path.exists(frontend_dir):
-    css_dir = os.path.join(frontend_dir, "css")
-    js_dir  = os.path.join(frontend_dir, "js")
-    if os.path.exists(css_dir):
-        app.mount("/css", StaticFiles(directory=css_dir), name="css")
-    if os.path.exists(js_dir):
-        app.mount("/js", StaticFiles(directory=js_dir), name="js")
-    logger.info(f"📂 Frontend cargado desde: {frontend_dir}")
-
+@app.get("/auth/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    return {"id": user["id"], "username": user["username"], "webhook_secret": user["webhook_secret"]}
 
 # ─── Webhook ───────────────────────────────────────────────────────────────────
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-    """Endpoint principal para recibir alertas de TradingView."""
-    raw_body = await request.body()
-    try:
-        payload = json.loads(raw_body)
-    except Exception as e:
-        body_text = raw_body.decode(errors="replace")
-        error_msg = f"❌ <b>Error JSON Webhook</b>\nError: {str(e)}\nBody: <code>{body_text}</code>"
-        logger.error(f"Error parseando JSON: {e} | Body: {body_text}")
-        await notifier.send_message(error_msg)
-        raise HTTPException(status_code=400, detail="JSON inválido")
+    payload = await request.json()
+    secret = payload.get("secret")
+    user = db.get_user_by_secret(secret)
+    if not user:
+        raise HTTPException(status_code=403, detail="Webhook secret inválido")
 
-    logger.info(f"📨 Webhook recibido: {payload}")
-
-    # Parsear y validar señal
     valid, msg, signal = parse_signal(payload)
     if not valid:
-        logger.warning(f"🚫 Señal inválida: {msg}")
-        # Guardar en base de datos para tener registro de señales inválidas
-        symbol = str(payload.get("symbol", "UNKNOWN"))
-        action_received = str(payload.get("action", "UNKNOWN"))
-        db.save_signal(symbol, action_received, payload, status="rejected", error=msg)
-        
-        # Notificar al dashboard de la señal rechazada
-        await manager.broadcast({
-            "type": "new_signal",
-            "symbol": symbol,
-            "action": action_received,
-            "result": {"success": False, "message": msg},
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
-        await notifier.send_message(f"🚫 <b>Señal rechazada</b>\nSímbolo: {symbol}\nAcción: {action_received}\nMotivo: {msg}")
-        raise HTTPException(status_code=403, detail=msg)
+        db.save_signal(user["id"], "UNKNOWN", "REJECTED", payload, status="error", error=msg)
+        raise HTTPException(status_code=400, detail=msg)
 
-    # Notificar señal válida recibida (internamente)
-    logger.info(f"📨 Señal válida: {signal['symbol']} {signal['action']}. Solicitando aprobación...")
-
-    # Guardar en base de datos como PENDING
-    signal_id = db.save_signal(
-        symbol=signal['symbol'],
-        action=signal['action'],
-        payload=payload,
-        status="pending"
-    )
-
-    # Notificar al dashboard de la señal pendiente
-    await manager.broadcast({
-        "type": "new_signal_pending",
-        "signal_id": signal_id,
-        "symbol": signal['symbol'],
-        "action": signal['action'],
-        "timestamp": datetime.utcnow().isoformat()
-    })
-
-    # Enviar mensaje de aprobación a Telegram
-    msg_id = await notifier.send_approval_message(
-        signal_id=signal_id,
-        symbol=signal['symbol'],
-        action=signal['action'],
-        price=signal.get('price')
-    )
+    # Iniciar procesamiento
+    broker = await session_manager.get_broker(user["id"])
+    notifier = await session_manager.get_notifier(user["id"])
+    risk = RiskManager(user["id"])
     
-    if not msg_id:
-        # Si falla Telegram, rechazar para seguridad? O procesar? 
-        # El usuario pidió que NUNCA se realice la acción sin contestar.
-        # Si no llega el mensaje, no podrá contestar. Logueamos el error grave.
-        logger.error("❌ Falló el envío del mensaje de aprobación a Telegram")
-        return {"status": "pending_local", "message": "Señal guardada pero falló aviso Telegram", "signal_id": signal_id}
+    om = OrderManager(user["id"], broker, notifier, risk)
+    # Por ahora procesamos directo (o podríamos enviarlo a Telegram para aprobación si se añade el polling)
+    asyncio.create_task(om.process_signal(signal))
+    
+    return {"status": "processing", "user": user["username"]}
 
-    return {
-        "status": "waiting_approval",
-        "message": "Señal recibida. Esperando aprobación manual en Telegram.",
-        "signal_id": signal_id,
-        "telegram_msg_id": msg_id
-    }
-
-
-# ─── Estado del Bot ────────────────────────────────────────────────────────────
-@app.get("/status")
-async def get_status():
-    """Estado general: conexión IBKR, modo (paper/real), bot activo, etc."""
-    return {
-        "ibkr_connected": ibkr.is_connected(),
-        "paper_trading": config.PAPER_TRADING,
-        "ibkr_port": config.IBKR_PORT,
-        "bot_enabled": risk_manager.bot_enabled,
-        "daily_stats": risk_manager.daily_stats,
-        "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-
-@app.post("/bot/toggle")
-async def toggle_bot(body: dict):
-    """Habilitar/deshabilitar el bot."""
-    enabled = body.get("enabled", True)
-    risk_manager.bot_enabled = enabled
-    action = "✅ Bot habilitado" if enabled else "🔴 Bot deshabilitado"
-    logger.info(action)
-    await manager.broadcast({"type": "bot_toggle", "enabled": enabled})
-    return {"success": True, "enabled": enabled, "message": action}
-
-
-@app.post("/bot/reconnect")
-async def reconnect_ibkr():
-    """Intentar reconectar con IBKR."""
-    await ibkr.connect()
-    return {"connected": ibkr.is_connected()}
-
-
-@app.post("/bot/close_all")
-async def close_all():
-    """Cerrar todas las posiciones."""
-    result = await order_manager.process_signal({"action": "close_all"})
-    await manager.broadcast({"type": "close_all", "result": result})
-    return result
-
-
-@app.post("/bot/cancel_all")
-async def cancel_all():
-    """Cancelar todas las órdenes pendientes."""
-    result = await ibkr.cancel_all_orders()
-    return {"success": result, "message": "Órdenes canceladas" if result else "Error"}
-
-
-# ─── Cuenta ────────────────────────────────────────────────────────────────────
+# ─── Dashboard Endpoints ───────────────────────────────────────────────────────
 @app.get("/account")
-async def get_account():
-    """Resumen de la cuenta IBKR. Devuelve vacío si no está conectado."""
-    if not ibkr.is_connected():
-        return {"ibkr_connected": False, "net_liquidation": 0, "buying_power": 0,
-                "cash_balance": 0, "unrealized_pnl": 0, "realized_pnl": 0}
-    return await ibkr.get_account_summary()
+async def get_account(user: dict = Depends(get_current_user)):
+    broker = await session_manager.get_broker(user["id"])
+    if not broker or not broker.is_connected():
+        return {"connected": False}
+    return await broker.get_account_summary()
 
-
-# ─── Posiciones ────────────────────────────────────────────────────────────────
 @app.get("/positions")
-async def get_positions():
-    """Posiciones abiertas actuales."""
-    if not ibkr.is_connected():
-        return []
-    return await ibkr.get_positions()
+async def get_positions(user: dict = Depends(get_current_user)):
+    broker = await session_manager.get_broker(user["id"])
+    return await broker.get_positions() if broker else []
 
-
-# ─── Órdenes ───────────────────────────────────────────────────────────────────
-@app.get("/orders")
-async def get_orders():
-    """Órdenes abiertas/pendientes."""
-    if not ibkr.is_connected():
-        return []
-    return await ibkr.get_open_orders()
-
-
-# ─── Señales ───────────────────────────────────────────────────────────────────
-@app.get("/signals")
-async def get_signals(limit: int = 50):
-    """Log de señales recibidas de TradingView."""
-    return db.get_signals(limit)
-
-
-# ─── Trades ────────────────────────────────────────────────────────────────────
 @app.get("/trades")
-async def get_trades(limit: int = 100, status: str = None):
-    """Historial de trades ejecutados."""
-    return db.get_trades(limit, status)
+async def get_trades(user: dict = Depends(get_current_user)):
+    return db.get_trades(user["id"])
 
-
-@app.post("/trades/sync")
-async def sync_trades():
-    """Importa posiciones abiertas en IBKR que no estén en la BD local."""
-    if not ibkr.is_connected():
-        raise HTTPException(status_code=503, detail="IBKR no conectado")
-    imported = await sync_ibkr_positions_to_db()
-    return {"success": True, "imported": imported, "message": f"{imported} posición(es) importada(s)"}
-
-
-# ─── P&L ───────────────────────────────────────────────────────────────────────
-@app.get("/pnl")
-async def get_pnl(days: int = 30):
-    """Histórico de P&L diario para el gráfico."""
-    return db.get_pnl_history(days)
-
-
-# ─── Configuración de Riesgo ───────────────────────────────────────────────────
 @app.get("/config/risk")
-async def get_risk_config():
-    """Configuración de riesgo actual."""
-    return db.get_risk_config()
+async def get_risk(user: dict = Depends(get_current_user)):
+    return db.get_risk_config(user["id"])
 
-
-@app.put("/config/risk")
-async def update_risk_config(body: dict):
-    """Actualizar configuración de riesgo."""
-    allowed_fields = {
-        "risk_per_trade_pct", "max_daily_loss_pct", "max_open_positions",
-        "default_stop_loss_pct", "default_take_profit_pct", "max_position_size_pct"
-    }
-    update = {k: v for k, v in body.items() if k in allowed_fields}
-    if not update:
-        raise HTTPException(status_code=400, detail="No hay campos válidos para actualizar")
-    db.update_risk_config(update)
-    logger.info(f"⚙️ Configuración de riesgo actualizada: {update}")
-    return {"success": True, "config": db.get_risk_config()}
-
-
-# ─── WebSocket ─────────────────────────────────────────────────────────────────
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    logger.info(f"🔗 Nueva conexión WebSocket ({len(manager.active_connections)} activas)")
-    try:
-        # Enviar estado inicial
-        account = await ibkr.get_account_summary() if ibkr.is_connected() else {}
-        positions = await ibkr.get_positions() if ibkr.is_connected() else []
-        await websocket.send_text(json.dumps({
-            "type": "init",
-            "ibkr_connected": ibkr.is_connected(),
-            "account": account,
-            "positions": positions,
-            "daily_stats": risk_manager.daily_stats,
-        }))
-        while True:
-            await websocket.receive_text()  # Keep alive
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        logger.info(f"🔌 WebSocket desconectado ({len(manager.active_connections)} activas)")
-
-
-# ─── Telegram Approval Logic ───────────────────────────────────────────────────
-async def telegram_polling():
-    """Tarea en segundo plano que consulta actualizaciones de Telegram (Long Polling)."""
-    if not notifier.enabled:
-        logger.warning("⚠️ Polling de Telegram desactivado (TOKEN o CHAT_ID faltantes)")
-        return
-
-    offset = 0
-    url = f"https://api.telegram.org/bot{notifier.token}/getUpdates"
-    logger.info("📡 Iniciando polling de Telegram para aprobaciones...")
+@app.put("/config/broker")
+async def update_broker_config(data: dict, user: dict = Depends(get_current_user)):
+    """Actualiza la configuración del broker del usuario."""
+    broker_type = data.get("broker_type")
+    broker_config = data.get("broker_config")
     
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                params = {"offset": offset, "timeout": 20, "allowed_updates": ["callback_query"]}
-                response = await client.get(url, params=params)
-                
-                if response.status_code != 200:
-                    await asyncio.sleep(5)
-                    continue
-                    
-                data = response.json()
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    if "callback_query" in update:
-                        asyncio.create_task(handle_telegram_callback(update["callback_query"]))
-                        
-        except Exception as e:
-            logger.error(f"Error en telegram_polling: {e}")
-            await asyncio.sleep(5)
-        
-        await asyncio.sleep(0.5)
-
-
-async def handle_telegram_callback(callback: dict):
-    """Procesa la respuesta del usuario (Aceptar/Rechazar) desde Telegram."""
-    query_id = callback["id"]
-    data = callback.get("data", "")
-    message = callback.get("message", {})
-    message_id = message.get("message_id")
-    
-    # Responder a Telegram para quitar el estado de carga en el botón
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(f"https://api.telegram.org/bot{notifier.token}/answerCallbackQuery", 
-                             json={"callback_query_id": query_id})
-    except:
-        pass
-
-    if not data or "_" not in data:
-        return
-
-    try:
-        action, signal_id = data.split("_")
-        signal_id = int(signal_id)
-    except Exception as e:
-        logger.error(f"Error parseando callback data {data}: {e}")
-        return
-
-    # Recuperar señal de la BD
-    signal_record = db.get_signal_by_id(signal_id)
-    if not signal_record:
-        await notifier.edit_message(message_id, "❌ <b>Error:</b> Señal no encontrada en la base de datos.")
-        return
-
-    if signal_record["status"] != "pending":
-        await notifier.edit_message(message_id, f"⚠️ Esta señal ya fue procesada.\nEstado actual: <b>{signal_record['status']}</b>", reply_markup={})
-        return
-
-    symbol = signal_record["symbol"]
-    act_received = signal_record["action"]
-
-    if action == "approve":
-        await notifier.edit_message(message_id, f"⏳ <b>Procesando aprobación...</b>\nSímbolo: {symbol}\nAcción: {act_received.upper()}", reply_markup={})
-        
-        # Recuperar payload y ejecutar
-        payload = json.loads(signal_record["raw_payload"])
-        valid, msg, signal = parse_signal(payload)
-        
-        if valid:
-            # EJECUTAR ACCIÓN
-            result = await order_manager.process_signal(signal)
-            
-            # Actualizar mensaje con el resultado de la ejecución
-            status_text = "✅ <b>EJECUTADA</b>" if result["success"] else f"❌ <b>ERROR</b>: {result['message']}"
-            await notifier.edit_message(message_id, f"{status_text}\nSímbolo: {symbol}\nAcción: {act_received.upper()}\nResultado: {result['message']}", reply_markup={})
-            
-            # Notificar al dashboard
-            await manager.broadcast({
-                "type": "new_signal",
-                "symbol": symbol,
-                "action": act_received,
-                "result": result,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-        else:
-            await notifier.edit_message(message_id, f"❌ <b>Error de re-parseo:</b> {msg}")
-            db.update_signal_status(signal_id, "failed", error=msg)
-
-    elif action == "reject":
-        db.update_signal_status(signal_id, "rejected")
-        await notifier.edit_message(message_id, f"🚫 <b>SEÑAL RECHAZADA</b>\nSímbolo: {symbol}\nAcción: {act_received.upper()}", reply_markup={})
-        
-        # Notificar al dashboard
-        await manager.broadcast({
-            "type": "new_signal",
-            "symbol": symbol,
-            "action": act_received,
-            "result": {"success": False, "message": "Rechazada manualmente por el usuario"},
-            "timestamp": datetime.utcnow().isoformat()
-        })
-
-
-# ─── Frontend ──────────────────────────────────────────────────────────────────
-@app.get("/")
-async def serve_dashboard():
-    """Sirve el dashboard web."""
-    index_path = os.path.join(frontend_dir, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"message": "Dashboard no encontrado - asegúrate de que la carpeta frontend existe"}
-
-
-# ─── Entry Point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=config.SERVER_HOST,
-        port=config.SERVER_PORT,
-        reload=False,
-        log_level=config.LOG_LEVEL.lower()
+    conn = db.get_db()
+    conn.execute(
+        "UPDATE users SET broker_type=?, broker_config=? WHERE id=?",
+        (broker_type, json.dumps(broker_config), user["id"])
     )
+    conn.commit()
+    conn.close()
+    
+    # Reiniciar sesión para aplicar cambios
+    await session_manager._init_session(user["id"])
+    return {"success": True}
+
+# ─── Frontend & Static ─────────────────────────────────────────────────────────
+frontend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
+if os.path.exists(frontend_dir):
+    app.mount("/css", StaticFiles(directory=os.path.join(frontend_dir, "css")), name="css")
+    app.mount("/js", StaticFiles(directory=os.path.join(frontend_dir, "js")), name="js")
+
+@app.get("/")
+async def index():
+    return FileResponse(os.path.join(frontend_dir, "index.html"))
+
+# ─── WebSocket Endpoints ───────────────────────────────────────────────────────
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str = None):
+    # En producción usaríamos el token para autenticar
+    await websocket.accept()
+    # Mock user_id 1 por ahora para pruebas de frontend iniciales
+    uid = 1 
+    await manager.connect(uid, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(uid, websocket)
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
