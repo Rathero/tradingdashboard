@@ -93,14 +93,16 @@ def init_db():
 
 # ─── Señales ───────────────────────────────────────────────────────────────────
 
-def save_signal(symbol: str, action: str, payload: dict, status: str = "pending", error: str = None, order_id: str = None):
+def save_signal(symbol: str, action: str, payload: dict, status: str = "pending", error: str = None, order_id: str = None) -> int:
     conn = get_db()
-    conn.execute("""
+    cursor = conn.execute("""
         INSERT INTO signals (received_at, symbol, action, raw_payload, status, error_msg, order_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (datetime.utcnow().isoformat(), symbol, action, json.dumps(payload), status, error, order_id))
+    signal_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    return signal_id
 
 
 def get_signals(limit: int = 50):
@@ -110,6 +112,13 @@ def get_signals(limit: int = 50):
     """, (limit,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_signal_by_id(signal_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM signals WHERE id=?", (signal_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def update_signal_status(signal_id: int, status: str, error: str = None, order_id: str = None):

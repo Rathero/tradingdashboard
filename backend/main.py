@@ -13,6 +13,7 @@ from datetime import datetime, date
 from typing import List
 
 import uvicorn
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -157,12 +158,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("⚠️ IBKR no disponible - arranca en modo desconectado")
 
-    # Iniciar updates en tiempo real
-    task = asyncio.create_task(push_live_updates())
+    # Iniciar actualizaciones en tiempo real y polling de Telegram
+    updates_task = asyncio.create_task(push_live_updates())
+    telegram_task = asyncio.create_task(telegram_polling())
 
     yield
 
-    task.cancel()
+    updates_task.cancel()
+    telegram_task.cancel()
     ibkr.disconnect()
     logger.info("👋 Bot detenido")
 
@@ -231,23 +234,47 @@ async def receive_webhook(request: Request):
         await notifier.send_message(f"🚫 <b>Señal rechazada</b>\nSímbolo: {symbol}\nAcción: {action_received}\nMotivo: {msg}")
         raise HTTPException(status_code=403, detail=msg)
 
-    # Notificar señal válida en Telegram
-    await notifier.send_message(f"📨 <b>Señal recibida</b>\nSímbolo: {signal['symbol']}\nAcción: {signal['action']}\nPrecio: {signal.get('price', 'Mercado')}")
+    # Notificar señal válida recibida (internamente)
+    logger.info(f"📨 Señal válida: {signal['symbol']} {signal['action']}. Solicitando aprobación...")
 
-    # Procesar señal (async)
-    result = await order_manager.process_signal(signal)
+    # Guardar en base de datos como PENDING
+    signal_id = db.save_signal(
+        symbol=signal['symbol'],
+        action=signal['action'],
+        payload=payload,
+        status="pending"
+    )
 
-    # Notificar al dashboard
+    # Notificar al dashboard de la señal pendiente
     await manager.broadcast({
-        "type": "new_signal",
-        "symbol": signal.get("symbol", ""),
-        "action": signal.get("action", ""),
-        "result": result,
+        "type": "new_signal_pending",
+        "signal_id": signal_id,
+        "symbol": signal['symbol'],
+        "action": signal['action'],
         "timestamp": datetime.utcnow().isoformat()
     })
 
-    status_code = 200 if result["success"] else 500
-    return {"status": "ok" if result["success"] else "error", **result}
+    # Enviar mensaje de aprobación a Telegram
+    msg_id = await notifier.send_approval_message(
+        signal_id=signal_id,
+        symbol=signal['symbol'],
+        action=signal['action'],
+        price=signal.get('price')
+    )
+    
+    if not msg_id:
+        # Si falla Telegram, rechazar para seguridad? O procesar? 
+        # El usuario pidió que NUNCA se realice la acción sin contestar.
+        # Si no llega el mensaje, no podrá contestar. Logueamos el error grave.
+        logger.error("❌ Falló el envío del mensaje de aprobación a Telegram")
+        return {"status": "pending_local", "message": "Señal guardada pero falló aviso Telegram", "signal_id": signal_id}
+
+    return {
+        "status": "waiting_approval",
+        "message": "Señal recibida. Esperando aprobación manual en Telegram.",
+        "signal_id": signal_id,
+        "telegram_msg_id": msg_id
+    }
 
 
 # ─── Estado del Bot ────────────────────────────────────────────────────────────
@@ -399,6 +426,119 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
         logger.info(f"🔌 WebSocket desconectado ({len(manager.active_connections)} activas)")
+
+
+# ─── Telegram Approval Logic ───────────────────────────────────────────────────
+async def telegram_polling():
+    """Tarea en segundo plano que consulta actualizaciones de Telegram (Long Polling)."""
+    if not notifier.enabled:
+        logger.warning("⚠️ Polling de Telegram desactivado (TOKEN o CHAT_ID faltantes)")
+        return
+
+    offset = 0
+    url = f"https://api.telegram.org/bot{notifier.token}/getUpdates"
+    logger.info("📡 Iniciando polling de Telegram para aprobaciones...")
+    
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                params = {"offset": offset, "timeout": 20, "allowed_updates": ["callback_query"]}
+                response = await client.get(url, params=params)
+                
+                if response.status_code != 200:
+                    await asyncio.sleep(5)
+                    continue
+                    
+                data = response.json()
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    if "callback_query" in update:
+                        asyncio.create_task(handle_telegram_callback(update["callback_query"]))
+                        
+        except Exception as e:
+            logger.error(f"Error en telegram_polling: {e}")
+            await asyncio.sleep(5)
+        
+        await asyncio.sleep(0.5)
+
+
+async def handle_telegram_callback(callback: dict):
+    """Procesa la respuesta del usuario (Aceptar/Rechazar) desde Telegram."""
+    query_id = callback["id"]
+    data = callback.get("data", "")
+    message = callback.get("message", {})
+    message_id = message.get("message_id")
+    
+    # Responder a Telegram para quitar el estado de carga en el botón
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(f"https://api.telegram.org/bot{notifier.token}/answerCallbackQuery", 
+                             json={"callback_query_id": query_id})
+    except:
+        pass
+
+    if not data or "_" not in data:
+        return
+
+    try:
+        action, signal_id = data.split("_")
+        signal_id = int(signal_id)
+    except Exception as e:
+        logger.error(f"Error parseando callback data {data}: {e}")
+        return
+
+    # Recuperar señal de la BD
+    signal_record = db.get_signal_by_id(signal_id)
+    if not signal_record:
+        await notifier.edit_message(message_id, "❌ <b>Error:</b> Señal no encontrada en la base de datos.")
+        return
+
+    if signal_record["status"] != "pending":
+        await notifier.edit_message(message_id, f"⚠️ Esta señal ya fue procesada.\nEstado actual: <b>{signal_record['status']}</b>", reply_markup={})
+        return
+
+    symbol = signal_record["symbol"]
+    act_received = signal_record["action"]
+
+    if action == "approve":
+        await notifier.edit_message(message_id, f"⏳ <b>Procesando aprobación...</b>\nSímbolo: {symbol}\nAcción: {act_received.upper()}", reply_markup={})
+        
+        # Recuperar payload y ejecutar
+        payload = json.loads(signal_record["raw_payload"])
+        valid, msg, signal = parse_signal(payload)
+        
+        if valid:
+            # EJECUTAR ACCIÓN
+            result = await order_manager.process_signal(signal)
+            
+            # Actualizar mensaje con el resultado de la ejecución
+            status_text = "✅ <b>EJECUTADA</b>" if result["success"] else f"❌ <b>ERROR</b>: {result['message']}"
+            await notifier.edit_message(message_id, f"{status_text}\nSímbolo: {symbol}\nAcción: {act_received.upper()}\nResultado: {result['message']}", reply_markup={})
+            
+            # Notificar al dashboard
+            await manager.broadcast({
+                "type": "new_signal",
+                "symbol": symbol,
+                "action": act_received,
+                "result": result,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        else:
+            await notifier.edit_message(message_id, f"❌ <b>Error de re-parseo:</b> {msg}")
+            db.update_signal_status(signal_id, "failed", error=msg)
+
+    elif action == "reject":
+        db.update_signal_status(signal_id, "rejected")
+        await notifier.edit_message(message_id, f"🚫 <b>SEÑAL RECHAZADA</b>\nSímbolo: {symbol}\nAcción: {act_received.upper()}", reply_markup={})
+        
+        # Notificar al dashboard
+        await manager.broadcast({
+            "type": "new_signal",
+            "symbol": symbol,
+            "action": act_received,
+            "result": {"success": False, "message": "Rechazada manualmente por el usuario"},
+            "timestamp": datetime.utcnow().isoformat()
+        })
 
 
 # ─── Frontend ──────────────────────────────────────────────────────────────────
