@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class IBKRClient:
     def __init__(self):
-        self.ib = IB()
+        self.ib = None
         self.connected = False
         self._reconnect_task = None
         self._account_id = None
@@ -25,6 +25,12 @@ class IBKRClient:
 
     async def connect(self):
         """Conecta a TWS o IB Gateway."""
+        if self.ib is None:
+            self.ib = IB()
+            # Suscribir a eventos
+            self.ib.disconnectedEvent += self._on_disconnected
+            self.ib.errorEvent += self._on_error
+
         try:
             await self.ib.connectAsync(
                 host=config.IBKR_HOST,
@@ -35,10 +41,6 @@ class IBKRClient:
             self.connected = True
             accounts = self.ib.managedAccounts()
             self._account_id = accounts[0] if accounts else None
-
-            # Suscribir a eventos
-            self.ib.disconnectedEvent += self._on_disconnected
-            self.ib.errorEvent += self._on_error
 
             mode = "📄 PAPER TRADING" if config.PAPER_TRADING else "💸 REAL TRADING"
             logger.info(f"✅ Conectado a IBKR {mode} | Cuenta: {self._account_id} | Puerto: {config.IBKR_PORT}")
@@ -82,7 +84,7 @@ class IBKRClient:
         logger.error("❌ No se pudo reconectar después de múltiples intentos")
 
     def is_connected(self) -> bool:
-        return self.connected and self.ib.isConnected()
+        return self.connected and self.ib is not None and self.ib.isConnected()
 
     # ─── Contratos ─────────────────────────────────────────────────────────────
 

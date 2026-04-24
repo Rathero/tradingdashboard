@@ -40,8 +40,8 @@ if not exist ".env" (
 
 echo.
 echo [INFO] Iniciando Trading Bot...
-echo [INFO] Dashboard: http://localhost:8000
-echo [INFO] API Docs:  http://localhost:8000/docs
+echo [INFO] Dashboard: http://localhost:8080
+echo [INFO] API Docs:  http://localhost:8080/docs
 echo [INFO] Presiona Ctrl+C para detener
 echo.
 

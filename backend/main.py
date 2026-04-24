@@ -5,6 +5,17 @@ FastAPI Server principal:
 - WebSocket para actualizaciones en tiempo real
 """
 import asyncio
+import sys
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import json
 import logging
 import os
@@ -25,6 +36,7 @@ from order_manager import order_manager
 from risk_manager import risk_manager
 from signal_processor import parse_signal
 from notifier import notifier
+from gemini_client import generate_trading_tip
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -145,6 +157,11 @@ async def sync_ibkr_positions_to_db() -> int:
 # ─── App Lifecycle ─────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    loop = asyncio.get_running_loop()
+    asyncio.set_event_loop(loop)
+    import eventkit.util
+    eventkit.util.main_event_loop = loop
+    
     logger.info("🚀 Iniciando Trading Bot...")
     db.init_db()
 
@@ -231,8 +248,17 @@ async def receive_webhook(request: Request):
         await notifier.send_message(f"🚫 <b>Señal rechazada</b>\nSímbolo: {symbol}\nAcción: {action_received}\nMotivo: {msg}")
         raise HTTPException(status_code=403, detail=msg)
 
-    # Notificar señal válida en Telegram
-    await notifier.send_message(f"📨 <b>Señal recibida</b>\nSímbolo: {signal['symbol']}\nAcción: {signal['action']}\nPrecio: {signal.get('price', 'Mercado')}")
+    # Notificar señal válida en Telegram + tip de Gemini
+    tip = await generate_trading_tip(signal['symbol'], signal['action'])
+    telegram_msg = (
+        f"📨 <b>Señal recibida</b>\n"
+        f"Símbolo: {signal['symbol']}\n"
+        f"Acción: {signal['action'].upper()}\n"
+        f"Precio: {signal.get('price', 'Mercado')}"
+    )
+    if tip:
+        telegram_msg += f"\n\n💡 <b>Tip del Portfolio Manager:</b>\n{tip}"
+    await notifier.send_message(telegram_msg)
 
     # Procesar señal (async)
     result = await order_manager.process_signal(signal)

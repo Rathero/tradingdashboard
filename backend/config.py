@@ -15,7 +15,7 @@ PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
 # ─── Servidor ──────────────────────────────────────────────────────────────────
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
+SERVER_PORT = int(os.getenv("SERVER_PORT", 8080))
 
 # ─── Seguridad Webhook ─────────────────────────────────────────────────────────
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "CAMBIA_ESTA_CLAVE_SECRETA_123")
@@ -34,6 +34,9 @@ DB_PATH = os.getenv("DB_PATH", "trading_bot.db")
 # ─── Telegram Notificaciones ──────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ─── Google Gemini (Tips de trading) ──────────────────────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
