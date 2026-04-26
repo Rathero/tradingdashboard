@@ -58,7 +58,43 @@
 </header>
 
 <!-- ═══════════════════════════════════════ MAIN ══════════════════════════════ -->
-<main class="main-layout">
+<!-- ═══════════════════════════════════════ AUTH OVERLAY ════════════════════════ -->
+<div id="auth-overlay" class="auth-overlay">
+  <div class="auth-card">
+    <div class="auth-header">
+      <i class="fas fa-robot"></i>
+      <h2>Trading Bot SaaS</h2>
+      <p id="auth-subtitle">Inicia sesión para gestionar tu trading</p>
+    </div>
+    <div id="login-form">
+      <div class="form-group">
+        <label>Usuario</label>
+        <input type="text" id="login-username" placeholder="Tu usuario" />
+      </div>
+      <div class="form-group">
+        <label>Contraseña</label>
+        <input type="password" id="login-password" placeholder="••••••••" />
+      </div>
+      <button class="btn btn-primary btn-block" onclick="login()">Entrar</button>
+      <p class="auth-footer">¿No tienes cuenta? <a href="#" onclick="showRegister()">Regístrate</a></p>
+    </div>
+    <div id="register-form" style="display:none">
+      <div class="form-group">
+        <label>Nuevo Usuario</label>
+        <input type="text" id="reg-username" placeholder="Usuario deseado" />
+      </div>
+      <div class="form-group">
+        <label>Contraseña</label>
+        <input type="password" id="reg-password" placeholder="Mín. 8 caracteres" />
+      </div>
+      <button class="btn btn-success btn-block" onclick="register()">Crear Cuenta</button>
+      <p class="auth-footer">¿Ya tienes cuenta? <a href="#" onclick="showLogin()">Inicia sesión</a></p>
+    </div>
+  </div>
+</div>
+
+<main class="main-layout" id="main-content" style="display:none">
+  <!-- (Contenido existente de la main-layout) -->
 
   <!-- ─── Stats Cards ─────────────────────────────────────────────────── -->
   <section class="stats-grid">
@@ -241,6 +277,52 @@
               <div class="risk-bar-fill" id="risk-bar"></div>
             </div>
             <p class="risk-bar-text" id="risk-bar-text">$0 / Máx $0</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Broker Config -->
+      <div class="card">
+        <div class="card-header">
+          <h3><i class="fas fa-university"></i> Conexión Broker</h3>
+          <button class="btn btn-sm btn-primary" onclick="saveBrokerConfig()">
+            <i class="fas fa-save"></i> Conectar
+          </button>
+        </div>
+        <div class="card-body">
+          <div class="form-group">
+            <label>Tipo de Broker</label>
+            <select id="broker-type" class="select-full" onchange="toggleBrokerFields()">
+              <option value="ibkr">Interactive Brokers (Local/Gateway)</option>
+              <option value="alpaca">Alpaca (Cloud API)</option>
+            </select>
+          </div>
+          
+          <div id="fields-ibkr" class="broker-fields">
+            <div class="form-group">
+              <label>Host</label>
+              <input type="text" id="ibkr-host" value="127.0.0.1" />
+            </div>
+            <div class="form-group">
+              <label>Puerto TWS/Gateway</label>
+              <input type="number" id="ibkr-port" value="7497" />
+            </div>
+          </div>
+
+          <div id="fields-alpaca" class="broker-fields" style="display:none">
+            <div class="form-group">
+              <label>Alpaca API Key</label>
+              <input type="text" id="alpaca-key" placeholder="PK..." />
+            </div>
+            <div class="form-group">
+              <label>Alpaca Secret Key</label>
+              <input type="password" id="alpaca-secret" placeholder="••••••••" />
+            </div>
+            <div class="form-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="alpaca-paper" checked /> Paper Trading
+              </label>
+            </div>
           </div>
         </div>
       </div>

@@ -1,9 +1,3 @@
-"""
-FastAPI Server principal:
-- Webhook para recibir señales de TradingView
-- REST API para el dashboard
-- WebSocket para actualizaciones en tiempo real
-"""
 import asyncio
 import sys
 
@@ -19,22 +13,27 @@ except RuntimeError:
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, date
-from typing import List
+from datetime import datetime, date, timedelta
+from typing import List, Dict, Any, Optional
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+import httpx
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel
 
 import config
 import database as db
-from ibkr_client import ibkr
-from order_manager import order_manager
-from risk_manager import risk_manager
+from core.auth import get_password_hash, verify_password, create_access_token, get_current_user
+from core.session_manager import session_manager
 from signal_processor import parse_signal
+from order_manager import OrderManager
+from risk_manager import RiskManager
 from notifier import notifier
 from gemini_client import generate_trading_tip
 
@@ -45,116 +44,75 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 logger = logging.getLogger(__name__)
-
-# Silenciar los logs de nivel INFO de ib_insync ("Warning 10167" se registra como INFO allí)
 logging.getLogger("ib_insync").setLevel(logging.WARNING)
-logging.getLogger("ib_insync.wrapper").setLevel(logging.ERROR)
 
+# ─── Models ────────────────────────────────────────────────────────────────────
+class UserRegister(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 # ─── WebSocket Manager ─────────────────────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        # user_id -> List[WebSocket]
+        self.active_connections: Dict[int, List[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        if user_id not in self.active_connections:
+            self.active_connections[user_id] = []
+        self.active_connections[user_id].append(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, user_id: int, websocket: WebSocket):
+        if user_id in self.active_connections:
+            if websocket in self.active_connections[user_id]:
+                self.active_connections[user_id].remove(websocket)
 
-    async def broadcast(self, data: dict):
+    async def send_to_user(self, user_id: int, data: dict):
+        if user_id not in self.active_connections:
+            return
         msg = json.dumps(data)
-        dead = []
-        for ws in self.active_connections:
+        for ws in self.active_connections[user_id]:
             try:
                 await ws.send_text(msg)
             except:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
-
+                pass
 
 manager = ConnectionManager()
 
-
-# ─── Background tasks ──────────────────────────────────────────────────────────
+# ─── Background Tasks ──────────────────────────────────────────────────────────
 async def push_live_updates():
-    """Envía actualizaciones en tiempo real al dashboard cada 3 segundos."""
+    """Actualiza datos para todos los usuarios activos cada 5 segundos."""
     while True:
-        await asyncio.sleep(3)
-        try:
-            if not manager.active_connections:
-                continue
+        await asyncio.sleep(5)
+        users = db.get_active_users()
+        for user in users:
+            uid = user['id']
+            try:
+                broker = await session_manager.get_broker(uid)
+                if not broker or not broker.is_connected(): continue
 
-            account = await ibkr.get_account_summary() if ibkr.is_connected() else {}
-            positions = await ibkr.get_positions() if ibkr.is_connected() else []
+                acc = await broker.get_account_summary()
+                pos = await broker.get_positions()
+                
+                # Sincronizar P&L en BD (Simplificado)
+                today = date.today().isoformat()
+                db.upsert_daily_pnl(uid, today, acc.get("realized_pnl", 0), acc.get("unrealized_pnl", 0), 0, 0)
 
-            # Actualizar P&L diario en BD
-            today_str = date.today().isoformat()
-            closed_today = db.get_trades(status="closed")
-            today_pnl = sum(t.get("realized_pnl", 0) or 0 for t in closed_today
-                            if t.get("closed_at", "").startswith(today_str))
-            unrealized = sum(p.get("unrealized_pnl", 0) for p in positions)
+                await manager.send_to_user(uid, {
+                    "type": "live_update",
+                    "account": acc,
+                    "positions": pos,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            except Exception as e:
+                logger.debug(f"Error update usuario {uid}: {e}")
 
-            db.upsert_daily_pnl(
-                date=today_str,
-                realized_pnl=today_pnl,
-                unrealized_pnl=unrealized,
-                total=risk_manager._daily_trades,
-                winning=risk_manager._winning_trades,
-            )
-
-            await manager.broadcast({
-                "type": "live_update",
-                "timestamp": datetime.utcnow().isoformat(),
-                "ibkr_connected": ibkr.is_connected(),
-                "account": account,
-                "positions": positions,
-                "daily_stats": risk_manager.daily_stats,
-            })
-        except Exception as e:
-            logger.debug(f"Error en push_live_updates: {e}")
-
-
-# ─── Sincronizar posiciones IBKR → BD ─────────────────────────────────────────
-async def sync_ibkr_positions_to_db() -> int:
-    """
-    Importa las posiciones abiertas en IBKR a la tabla 'trades' local
-    como registros con status='open', evitando duplicados por ibkr_order_id o símbolo.
-    Devuelve el número de posiciones importadas.
-    """
-    if not ibkr.is_connected():
-        return 0
-    try:
-        positions = await ibkr.get_positions()
-        existing = {t["symbol"]: t for t in db.get_trades(status="open")}
-        imported = 0
-        for pos in positions:
-            sym = pos["symbol"]
-            if sym in existing:
-                continue  # ya registrado
-            db.save_trade(
-                symbol=sym,
-                side=pos["side"],
-                qty=pos["qty"],
-                entry_price=pos["avg_cost"],
-                stop_loss=None,
-                take_profit=None,
-                ibkr_order_id=None,
-            )
-            imported += 1
-            logger.info(f"📥 Posición importada de IBKR → BD: {pos['side']} {pos['qty']} {sym} @ {pos['avg_cost']}")
-        if imported:
-            logger.info(f"✅ {imported} posición(es) sincronizadas desde IBKR")
-        return imported
-    except Exception as e:
-        logger.error(f"Error sincronizando posiciones IBKR: {e}")
-        return 0
-
-
-# ─── App Lifecycle ─────────────────────────────────────────────────────────────
+# ─── Lifecycle ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
@@ -164,90 +122,67 @@ async def lifespan(app: FastAPI):
     
     logger.info("🚀 Iniciando Trading Bot...")
     db.init_db()
-
-    # Conectar a IBKR
-    connected = await ibkr.connect()
-    if connected:
-        logger.info("✅ IBKR conectado")
-        # Importar posiciones existentes que no estén ya en la BD
-        await sync_ibkr_positions_to_db()
-    else:
-        logger.warning("⚠️ IBKR no disponible - arranca en modo desconectado")
-
-    # Iniciar updates en tiempo real
     task = asyncio.create_task(push_live_updates())
-
     yield
-
     task.cancel()
-    ibkr.disconnect()
-    logger.info("👋 Bot detenido")
+    await session_manager.close_all()
 
+app = FastAPI(title="Trading SaaS API", version="2.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ─── FastAPI App ───────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Trading Bot API",
-    description="Bot de trading automático TradingView + Interactive Brokers",
-    version="1.0.0",
-    lifespan=lifespan
-)
+# ─── Auth Endpoints ────────────────────────────────────────────────────────────
+@app.post("/auth/register")
+async def register(user_data: UserRegister):
+    if db.get_user_by_username(user_data.username):
+        raise HTTPException(status_code=400, detail="El usuario ya existe")
+    
+    secret = str(uuid.uuid4())[:18]
+    uid = db.create_user(
+        username=user_data.username,
+        password_hash=get_password_hash(user_data.password),
+        webhook_secret=secret
+    )
+    return {"message": "Usuario creado", "webhook_secret": secret}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.post("/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = db.get_user_by_username(form_data.username)
+    if not user or not verify_password(form_data.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+    
+    access_token = create_access_token(data={"sub": user["username"]})
+    return {"access_token": access_token, "token_type": "bearer"}
 
-# Servir el frontend — montamos /css y /js directamente para que el HTML los encuentre
-frontend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
-if os.path.exists(frontend_dir):
-    css_dir = os.path.join(frontend_dir, "css")
-    js_dir  = os.path.join(frontend_dir, "js")
-    if os.path.exists(css_dir):
-        app.mount("/css", StaticFiles(directory=css_dir), name="css")
-    if os.path.exists(js_dir):
-        app.mount("/js", StaticFiles(directory=js_dir), name="js")
-    logger.info(f"📂 Frontend cargado desde: {frontend_dir}")
-
+@app.get("/auth/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    return {"id": user["id"], "username": user["username"], "webhook_secret": user["webhook_secret"]}
 
 # ─── Webhook ───────────────────────────────────────────────────────────────────
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-    """Endpoint principal para recibir alertas de TradingView."""
-    raw_body = await request.body()
-    try:
-        payload = json.loads(raw_body)
-    except Exception as e:
-        body_text = raw_body.decode(errors="replace")
-        error_msg = f"❌ <b>Error JSON Webhook</b>\nError: {str(e)}\nBody: <code>{body_text}</code>"
-        logger.error(f"Error parseando JSON: {e} | Body: {body_text}")
-        await notifier.send_message(error_msg)
-        raise HTTPException(status_code=400, detail="JSON inválido")
+    payload = await request.json()
+    secret = payload.get("secret")
+    user = db.get_user_by_secret(secret)
+    if not user:
+        raise HTTPException(status_code=403, detail="Webhook secret inválido")
 
-    logger.info(f"📨 Webhook recibido: {payload}")
-
-    # Parsear y validar señal
     valid, msg, signal = parse_signal(payload)
     if not valid:
-        logger.warning(f"🚫 Señal inválida: {msg}")
-        # Guardar en base de datos para tener registro de señales inválidas
-        symbol = str(payload.get("symbol", "UNKNOWN"))
-        action_received = str(payload.get("action", "UNKNOWN"))
-        db.save_signal(symbol, action_received, payload, status="rejected", error=msg)
-        
-        # Notificar al dashboard de la señal rechazada
-        await manager.broadcast({
-            "type": "new_signal",
-            "symbol": symbol,
-            "action": action_received,
-            "result": {"success": False, "message": msg},
-            "timestamp": datetime.utcnow().isoformat()
-        })
-        
-        await notifier.send_message(f"🚫 <b>Señal rechazada</b>\nSímbolo: {symbol}\nAcción: {action_received}\nMotivo: {msg}")
-        raise HTTPException(status_code=403, detail=msg)
+        db.save_signal(user["id"], "UNKNOWN", "REJECTED", payload, status="error", error=msg)
+        raise HTTPException(status_code=400, detail=msg)
 
+    # Iniciar procesamiento
+    broker = await session_manager.get_broker(user["id"])
+    notifier = await session_manager.get_notifier(user["id"])
+    risk = RiskManager(user["id"])
+    
+    om = OrderManager(user["id"], broker, notifier, risk)
+    # Por ahora procesamos directo (o podríamos enviarlo a Telegram para aprobación si se añade el polling)
+    asyncio.create_task(om.process_signal(signal))
+    
+    return {"status": "processing", "user": user["username"]}
+
+# ─── Dashboard Endpoints ───────────────────────────────────────────────────────
     # Notificar señal válida en Telegram + tip de Gemini
     tip = await generate_trading_tip(signal['symbol'], signal['action'])
     telegram_msg = (
@@ -326,123 +261,65 @@ async def cancel_all():
 
 # ─── Cuenta ────────────────────────────────────────────────────────────────────
 @app.get("/account")
-async def get_account():
-    """Resumen de la cuenta IBKR. Devuelve vacío si no está conectado."""
-    if not ibkr.is_connected():
-        return {"ibkr_connected": False, "net_liquidation": 0, "buying_power": 0,
-                "cash_balance": 0, "unrealized_pnl": 0, "realized_pnl": 0}
-    return await ibkr.get_account_summary()
+async def get_account(user: dict = Depends(get_current_user)):
+    broker = await session_manager.get_broker(user["id"])
+    if not broker or not broker.is_connected():
+        return {"connected": False}
+    return await broker.get_account_summary()
 
-
-# ─── Posiciones ────────────────────────────────────────────────────────────────
 @app.get("/positions")
-async def get_positions():
-    """Posiciones abiertas actuales."""
-    if not ibkr.is_connected():
-        return []
-    return await ibkr.get_positions()
+async def get_positions(user: dict = Depends(get_current_user)):
+    broker = await session_manager.get_broker(user["id"])
+    return await broker.get_positions() if broker else []
 
-
-# ─── Órdenes ───────────────────────────────────────────────────────────────────
-@app.get("/orders")
-async def get_orders():
-    """Órdenes abiertas/pendientes."""
-    if not ibkr.is_connected():
-        return []
-    return await ibkr.get_open_orders()
-
-
-# ─── Señales ───────────────────────────────────────────────────────────────────
-@app.get("/signals")
-async def get_signals(limit: int = 50):
-    """Log de señales recibidas de TradingView."""
-    return db.get_signals(limit)
-
-
-# ─── Trades ────────────────────────────────────────────────────────────────────
 @app.get("/trades")
-async def get_trades(limit: int = 100, status: str = None):
-    """Historial de trades ejecutados."""
-    return db.get_trades(limit, status)
+async def get_trades(user: dict = Depends(get_current_user)):
+    return db.get_trades(user["id"])
 
-
-@app.post("/trades/sync")
-async def sync_trades():
-    """Importa posiciones abiertas en IBKR que no estén en la BD local."""
-    if not ibkr.is_connected():
-        raise HTTPException(status_code=503, detail="IBKR no conectado")
-    imported = await sync_ibkr_positions_to_db()
-    return {"success": True, "imported": imported, "message": f"{imported} posición(es) importada(s)"}
-
-
-# ─── P&L ───────────────────────────────────────────────────────────────────────
-@app.get("/pnl")
-async def get_pnl(days: int = 30):
-    """Histórico de P&L diario para el gráfico."""
-    return db.get_pnl_history(days)
-
-
-# ─── Configuración de Riesgo ───────────────────────────────────────────────────
 @app.get("/config/risk")
-async def get_risk_config():
-    """Configuración de riesgo actual."""
-    return db.get_risk_config()
+async def get_risk(user: dict = Depends(get_current_user)):
+    return db.get_risk_config(user["id"])
 
-
-@app.put("/config/risk")
-async def update_risk_config(body: dict):
-    """Actualizar configuración de riesgo."""
-    allowed_fields = {
-        "risk_per_trade_pct", "max_daily_loss_pct", "max_open_positions",
-        "default_stop_loss_pct", "default_take_profit_pct", "max_position_size_pct"
-    }
-    update = {k: v for k, v in body.items() if k in allowed_fields}
-    if not update:
-        raise HTTPException(status_code=400, detail="No hay campos válidos para actualizar")
-    db.update_risk_config(update)
-    logger.info(f"⚙️ Configuración de riesgo actualizada: {update}")
-    return {"success": True, "config": db.get_risk_config()}
-
-
-# ─── WebSocket ─────────────────────────────────────────────────────────────────
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    logger.info(f"🔗 Nueva conexión WebSocket ({len(manager.active_connections)} activas)")
-    try:
-        # Enviar estado inicial
-        account = await ibkr.get_account_summary() if ibkr.is_connected() else {}
-        positions = await ibkr.get_positions() if ibkr.is_connected() else []
-        await websocket.send_text(json.dumps({
-            "type": "init",
-            "ibkr_connected": ibkr.is_connected(),
-            "account": account,
-            "positions": positions,
-            "daily_stats": risk_manager.daily_stats,
-        }))
-        while True:
-            await websocket.receive_text()  # Keep alive
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        logger.info(f"🔌 WebSocket desconectado ({len(manager.active_connections)} activas)")
-
-
-# ─── Frontend ──────────────────────────────────────────────────────────────────
-@app.get("/")
-async def serve_dashboard():
-    """Sirve el dashboard web."""
-    index_path = os.path.join(frontend_dir, "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return {"message": "Dashboard no encontrado - asegúrate de que la carpeta frontend existe"}
-
-
-# ─── Entry Point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=config.SERVER_HOST,
-        port=config.SERVER_PORT,
-        reload=False,
-        log_level=config.LOG_LEVEL.lower()
+@app.put("/config/broker")
+async def update_broker_config(data: dict, user: dict = Depends(get_current_user)):
+    """Actualiza la configuración del broker del usuario."""
+    broker_type = data.get("broker_type")
+    broker_config = data.get("broker_config")
+    
+    conn = db.get_db()
+    conn.execute(
+        "UPDATE users SET broker_type=?, broker_config=? WHERE id=?",
+        (broker_type, json.dumps(broker_config), user["id"])
     )
+    conn.commit()
+    conn.close()
+    
+    # Reiniciar sesión para aplicar cambios
+    await session_manager._init_session(user["id"])
+    return {"success": True}
+
+# ─── Frontend & Static ─────────────────────────────────────────────────────────
+frontend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
+if os.path.exists(frontend_dir):
+    app.mount("/css", StaticFiles(directory=os.path.join(frontend_dir, "css")), name="css")
+    app.mount("/js", StaticFiles(directory=os.path.join(frontend_dir, "js")), name="js")
+
+@app.get("/")
+async def index():
+    return FileResponse(os.path.join(frontend_dir, "index.html"))
+
+# ─── WebSocket Endpoints ───────────────────────────────────────────────────────
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str = None):
+    # En producción usaríamos el token para autenticar
+    # Mock user_id 1 por ahora para pruebas de frontend iniciales
+    uid = 1 
+    await manager.connect(uid, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(uid, websocket)
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
