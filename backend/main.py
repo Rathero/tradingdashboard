@@ -1,4 +1,13 @@
 import asyncio
+import sys
+
+
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import json
 import logging
 import os
@@ -23,6 +32,7 @@ from core.session_manager import session_manager
 from signal_processor import parse_signal
 from order_manager import OrderManager
 from risk_manager import RiskManager
+from gemini_client import generate_trading_tip
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -102,6 +112,12 @@ async def push_live_updates():
 # ─── Lifecycle ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    loop = asyncio.get_running_loop()
+    asyncio.set_event_loop(loop)
+    import eventkit.util
+    eventkit.util.main_event_loop = loop
+    
+    logger.info("🚀 Iniciando Trading Bot...")
     db.init_db()
     task = asyncio.create_task(push_live_updates())
     yield
@@ -158,12 +174,86 @@ async def receive_webhook(request: Request):
     risk = RiskManager(user["id"])
     
     om = OrderManager(user["id"], broker, notifier, risk)
-    # Por ahora procesamos directo (o podríamos enviarlo a Telegram para aprobación si se añade el polling)
-    asyncio.create_task(om.process_signal(signal))
+    async def process_and_notify():
+        # Procesar señal en el broker
+        result = await om.process_signal(signal)
+        
+        # Generar tip y notificar a Telegram
+        tip = await generate_trading_tip(signal.get('symbol', ''), signal.get('action', ''))
+        telegram_msg = (
+            f"📨 <b>Señal recibida</b>\n"
+            f"Símbolo: {signal.get('symbol', '')}\n"
+            f"Acción: {signal.get('action', '').upper()}\n"
+            f"Precio: {signal.get('price', 'Mercado')}"
+        )
+        if tip:
+            telegram_msg += f"\n\n💡 <b>Tip del Portfolio Manager:</b>\n{tip}"
+        await notifier.send_message(telegram_msg)
+
+        # Notificar al dashboard web
+        await manager.send_to_user(user["id"], {
+            "type": "new_signal",
+            "symbol": signal.get("symbol", ""),
+            "action": signal.get("action", ""),
+            "result": result,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
+    # Iniciar procesamiento en background
+    asyncio.create_task(process_and_notify())
     
     return {"status": "processing", "user": user["username"]}
 
-# ─── Dashboard Endpoints ───────────────────────────────────────────────────────
+
+# ─── Estado del Bot ────────────────────────────────────────────────────────────
+@app.get("/status")
+async def get_status():
+    """Estado general: conexión IBKR, modo (paper/real), bot activo, etc."""
+    return {
+        "ibkr_connected": ibkr.is_connected(),
+        "paper_trading": config.PAPER_TRADING,
+        "ibkr_port": config.IBKR_PORT,
+        "bot_enabled": risk_manager.bot_enabled,
+        "daily_stats": risk_manager.daily_stats,
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/bot/toggle")
+async def toggle_bot(body: dict):
+    """Habilitar/deshabilitar el bot."""
+    enabled = body.get("enabled", True)
+    risk_manager.bot_enabled = enabled
+    action = "✅ Bot habilitado" if enabled else "🔴 Bot deshabilitado"
+    logger.info(action)
+    await manager.broadcast({"type": "bot_toggle", "enabled": enabled})
+    return {"success": True, "enabled": enabled, "message": action}
+
+
+@app.post("/bot/reconnect")
+async def reconnect_ibkr():
+    """Intentar reconectar con IBKR."""
+    await ibkr.connect()
+    return {"connected": ibkr.is_connected()}
+
+
+@app.post("/bot/close_all")
+async def close_all():
+    """Cerrar todas las posiciones."""
+    result = await order_manager.process_signal({"action": "close_all"})
+    await manager.broadcast({"type": "close_all", "result": result})
+    return result
+
+
+@app.post("/bot/cancel_all")
+async def cancel_all():
+    """Cancelar todas las órdenes pendientes."""
+    result = await ibkr.cancel_all_orders()
+    return {"success": result, "message": "Órdenes canceladas" if result else "Error"}
+
+
+# ─── Cuenta ────────────────────────────────────────────────────────────────────
 @app.get("/account")
 async def get_account(user: dict = Depends(get_current_user)):
     broker = await session_manager.get_broker(user["id"])

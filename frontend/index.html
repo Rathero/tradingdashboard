@@ -294,7 +294,6 @@
             <label>Tipo de Broker</label>
             <select id="broker-type" class="select-full" onchange="toggleBrokerFields()">
               <option value="ibkr">Interactive Brokers (Local/Gateway)</option>
-              <option value="alpaca">Alpaca (Cloud API)</option>
             </select>
           </div>
           
@@ -306,22 +305,6 @@
             <div class="form-group">
               <label>Puerto TWS/Gateway</label>
               <input type="number" id="ibkr-port" value="7497" />
-            </div>
-          </div>
-
-          <div id="fields-alpaca" class="broker-fields" style="display:none">
-            <div class="form-group">
-              <label>Alpaca API Key</label>
-              <input type="text" id="alpaca-key" placeholder="PK..." />
-            </div>
-            <div class="form-group">
-              <label>Alpaca Secret Key</label>
-              <input type="password" id="alpaca-secret" placeholder="••••••••" />
-            </div>
-            <div class="form-group">
-              <label class="checkbox-label">
-                <input type="checkbox" id="alpaca-paper" checked /> Paper Trading
-              </label>
             </div>
           </div>
         </div>
@@ -348,7 +331,7 @@
         <div class="card-body">
           <p class="config-label">URL del Webhook (copiar en TradingView):</p>
           <div class="copy-box">
-            <code id="webhook-url">http://TU_IP:8000/webhook</code>
+            <code id="webhook-url">http://TU_IP:8080/webhook</code>
             <button onclick="copyWebhook()" class="copy-btn"><i class="fas fa-copy"></i></button>
           </div>
           <p class="config-label mt-16">Formato del mensaje:</p>

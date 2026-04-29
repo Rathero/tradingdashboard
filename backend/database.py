@@ -29,7 +29,7 @@ def init_db():
             webhook_secret TEXT UNIQUE NOT NULL,
             tg_token TEXT,
             tg_chat_id TEXT,
-            broker_type TEXT DEFAULT 'ibkr', -- 'ibkr' o 'alpaca'
+            broker_type TEXT DEFAULT 'ibkr', -- 'ibkr'
             broker_config TEXT,              -- JSON con host, port, api_key, etc.
             created_at TEXT NOT NULL
         )

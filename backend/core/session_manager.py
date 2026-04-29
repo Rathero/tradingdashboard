@@ -2,7 +2,6 @@ import logging
 import json
 from typing import Dict, Any, Optional
 from brokers.ibkr import IBKRBroker
-from brokers.alpaca import AlpacaBroker
 from notifier import TelegramNotifier
 import database as db
 
@@ -51,12 +50,6 @@ class SessionManager:
                 host=config.get("host", "127.0.0.1"),
                 port=int(config.get("port", 7497)),
                 client_id=int(config.get("client_id", user_id)) # Usamos user_id como client_id para evitar conflictos
-            )
-        elif broker_type == "alpaca":
-            broker = AlpacaBroker(
-                api_key=config.get("api_key"),
-                secret_key=config.get("secret_key"),
-                paper=config.get("paper", True)
             )
 
         if broker:

@@ -121,25 +121,14 @@ function updateUserInfo() {
 function toggleBrokerFields() {
     const type = document.getElementById("broker-type").value;
     document.getElementById("fields-ibkr").style.display = type === "ibkr" ? "block" : "none";
-    document.getElementById("fields-alpaca").style.display = type === "alpaca" ? "block" : "none";
 }
 
 async function saveBrokerConfig() {
     const type = document.getElementById("broker-type").value;
-    let config = {};
-    
-    if (type === "ibkr") {
-        config = {
-            host: document.getElementById("ibkr-host").value,
-            port: parseInt(document.getElementById("ibkr-port").value)
-        };
-    } else {
-        config = {
-            api_key: document.getElementById("alpaca-key").value,
-            secret_key: document.getElementById("alpaca-secret").value,
-            paper: document.getElementById("alpaca-paper").checked
-        };
-    }
+    let config = {
+        host: document.getElementById("ibkr-host").value,
+        port: parseInt(document.getElementById("ibkr-port").value)
+    };
 
     try {
         // En el backend actual, guardamos el broker_config en el perfil del usuario

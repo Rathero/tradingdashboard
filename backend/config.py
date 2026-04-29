@@ -14,10 +14,17 @@ JWT_ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 semana
 
 # ─── Servidor ──────────────────────────────────────────────────────────────────
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
+SERVER_PORT = int(os.getenv("SERVER_PORT", 8080))
 
 # ─── Base de Datos ─────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "trading_bot.db")
+
+# ─── Telegram Notificaciones ──────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ─── Google Gemini (Tips de trading) ──────────────────────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
