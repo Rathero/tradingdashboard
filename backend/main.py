@@ -32,7 +32,6 @@ from core.session_manager import session_manager
 from signal_processor import parse_signal
 from order_manager import OrderManager
 from risk_manager import RiskManager
-from notifier import notifier
 from gemini_client import generate_trading_tip
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
@@ -175,38 +174,35 @@ async def receive_webhook(request: Request):
     risk = RiskManager(user["id"])
     
     om = OrderManager(user["id"], broker, notifier, risk)
-    # Por ahora procesamos directo (o podríamos enviarlo a Telegram para aprobación si se añade el polling)
-    asyncio.create_task(om.process_signal(signal))
+    async def process_and_notify():
+        # Procesar señal en el broker
+        result = await om.process_signal(signal)
+        
+        # Generar tip y notificar a Telegram
+        tip = await generate_trading_tip(signal.get('symbol', ''), signal.get('action', ''))
+        telegram_msg = (
+            f"📨 <b>Señal recibida</b>\n"
+            f"Símbolo: {signal.get('symbol', '')}\n"
+            f"Acción: {signal.get('action', '').upper()}\n"
+            f"Precio: {signal.get('price', 'Mercado')}"
+        )
+        if tip:
+            telegram_msg += f"\n\n💡 <b>Tip del Portfolio Manager:</b>\n{tip}"
+        await notifier.send_message(telegram_msg)
+
+        # Notificar al dashboard web
+        await manager.send_to_user(user["id"], {
+            "type": "new_signal",
+            "symbol": signal.get("symbol", ""),
+            "action": signal.get("action", ""),
+            "result": result,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+
+    # Iniciar procesamiento en background
+    asyncio.create_task(process_and_notify())
     
     return {"status": "processing", "user": user["username"]}
-
-# ─── Dashboard Endpoints ───────────────────────────────────────────────────────
-    # Notificar señal válida en Telegram + tip de Gemini
-    tip = await generate_trading_tip(signal['symbol'], signal['action'])
-    telegram_msg = (
-        f"📨 <b>Señal recibida</b>\n"
-        f"Símbolo: {signal['symbol']}\n"
-        f"Acción: {signal['action'].upper()}\n"
-        f"Precio: {signal.get('price', 'Mercado')}"
-    )
-    if tip:
-        telegram_msg += f"\n\n💡 <b>Tip del Portfolio Manager:</b>\n{tip}"
-    await notifier.send_message(telegram_msg)
-
-    # Procesar señal (async)
-    result = await order_manager.process_signal(signal)
-
-    # Notificar al dashboard
-    await manager.broadcast({
-        "type": "new_signal",
-        "symbol": signal.get("symbol", ""),
-        "action": signal.get("action", ""),
-        "result": result,
-        "timestamp": datetime.utcnow().isoformat()
-    })
-
-    status_code = 200 if result["success"] else 500
-    return {"status": "ok" if result["success"] else "error", **result}
 
 
 # ─── Estado del Bot ────────────────────────────────────────────────────────────
