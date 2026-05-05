@@ -58,42 +58,8 @@
 </header>
 
 <!-- ═══════════════════════════════════════ MAIN ══════════════════════════════ -->
-<!-- ═══════════════════════════════════════ AUTH OVERLAY ════════════════════════ -->
-<div id="auth-overlay" class="auth-overlay">
-  <div class="auth-card">
-    <div class="auth-header">
-      <i class="fas fa-robot"></i>
-      <h2>Trading Bot SaaS</h2>
-      <p id="auth-subtitle">Inicia sesión para gestionar tu trading</p>
-    </div>
-    <div id="login-form">
-      <div class="form-group">
-        <label>Usuario</label>
-        <input type="text" id="login-username" placeholder="Tu usuario" />
-      </div>
-      <div class="form-group">
-        <label>Contraseña</label>
-        <input type="password" id="login-password" placeholder="••••••••" />
-      </div>
-      <button class="btn btn-primary btn-block" onclick="login()">Entrar</button>
-      <p class="auth-footer">¿No tienes cuenta? <a href="#" onclick="showRegister()">Regístrate</a></p>
-    </div>
-    <div id="register-form" style="display:none">
-      <div class="form-group">
-        <label>Nuevo Usuario</label>
-        <input type="text" id="reg-username" placeholder="Usuario deseado" />
-      </div>
-      <div class="form-group">
-        <label>Contraseña</label>
-        <input type="password" id="reg-password" placeholder="Mín. 8 caracteres" />
-      </div>
-      <button class="btn btn-success btn-block" onclick="register()">Crear Cuenta</button>
-      <p class="auth-footer">¿Ya tienes cuenta? <a href="#" onclick="showLogin()">Inicia sesión</a></p>
-    </div>
-  </div>
-</div>
 
-<main class="main-layout" id="main-content" style="display:none">
+<main class="main-layout" id="main-content">
   <!-- (Contenido existente de la main-layout) -->
 
   <!-- ─── Stats Cards ─────────────────────────────────────────────────── -->

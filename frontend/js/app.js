@@ -1,119 +1,30 @@
 /**
- * Lógica principal del Dashboard SaaS
+ * Lógica principal del Dashboard (anónimo)
  */
 
-// Variables de estado
-let API_TOKEN = localStorage.getItem("trading_sas_token");
-let CURRENT_USER = null;
-
-// Inicialización
+// Inicialización — directo al dashboard
 document.addEventListener("DOMContentLoaded", () => {
-    if (!API_TOKEN) {
-        showAuthOverlay();
-    } else {
-        initDashboard();
-    }
+    initDashboard();
 });
-
-// ─── Autenticación ────────────────────────────────────────────────────────────
-
-function showAuthOverlay() {
-    document.getElementById("auth-overlay").style.display = "flex";
-    document.getElementById("main-content").style.display = "none";
-}
-
-function showRegister() {
-    document.getElementById("login-form").style.display = "none";
-    document.getElementById("register-form").style.display = "block";
-    document.getElementById("auth-subtitle").innerText = "Crea tu cuenta de trading";
-}
-
-function showLogin() {
-    document.getElementById("register-form").style.display = "none";
-    document.getElementById("login-form").style.display = "block";
-    document.getElementById("auth-subtitle").innerText = "Inicia sesión para gestionar tu trading";
-}
-
-async function login() {
-    const user = document.getElementById("login-username").value;
-    const pass = document.getElementById("login-password").value;
-    
-    try {
-        const formData = new FormData();
-        formData.append("username", user);
-        formData.append("password", pass);
-
-        const resp = await fetch("/auth/login", {
-            method: "POST",
-            body: formData
-        });
-        
-        if (!resp.ok) throw new Error("Credenciales inválidas");
-        
-        const data = await resp.json();
-        API_TOKEN = data.access_token;
-        localStorage.setItem("trading_sas_token", API_TOKEN);
-        
-        initDashboard();
-    } catch (e) {
-        showToast(e.message, "error");
-    }
-}
-
-async function register() {
-    const user = document.getElementById("reg-username").value;
-    const pass = document.getElementById("reg-password").value;
-    
-    try {
-        const resp = await fetch("/auth/register", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ username: user, password: pass })
-        });
-        
-        if (!resp.ok) throw new Error("Error en el registro");
-        
-        showToast("¡Cuenta creada! Ahora inicia sesión", "success");
-        showLogin();
-    } catch (e) {
-        showToast(e.message, "error");
-    }
-}
-
-function logout() {
-    localStorage.removeItem("trading_sas_token");
-    location.reload();
-}
 
 // ─── Dashboard Logic ─────────────────────────────────────────────────────────
 
 async function initDashboard() {
-    document.getElementById("auth-overlay").style.display = "none";
     document.getElementById("main-content").style.display = "block";
     
-    // Cargar info de usuario
     try {
-        const resp = await fetch("/auth/me", {
-            headers: { "Authorization": `Bearer ${API_TOKEN}` }
-        });
-        if (!resp.ok) throw new Error("Token expirado");
-        CURRENT_USER = await resp.json();
-        
-        updateUserInfo();
         loadRiskConfig();
         loadTrades();
         loadSignals();
-        // Conectar WebSocket (se pasará a websocket.js)
-        connectWS(API_TOKEN);
+        updateWebhookUrl();
     } catch (e) {
-        logout();
+        console.error("Error inicializando dashboard:", e);
+        showToast("Error cargando el dashboard", "error");
     }
 }
 
-function updateUserInfo() {
+function updateWebhookUrl() {
     document.getElementById("webhook-url").innerText = `${window.location.origin}/webhook`;
-    // Aquí podrías añadir un botón de logout o mostrar el username
-    console.log("Logged as", CURRENT_USER.username);
 }
 
 // ─── Broker Config ───────────────────────────────────────────────────────────
@@ -131,9 +42,6 @@ async function saveBrokerConfig() {
     };
 
     try {
-        // En el backend actual, guardamos el broker_config en el perfil del usuario
-        // Podríamos tener un endpoint específico o un PUT /auth/me
-        // Por consistencia temporal, asumiremos un endpoint PUT /config/broker
         await apiFetch("/config/broker", "PUT", { broker_type: type, broker_config: config });
         showToast("Configuración de broker actualizada", "success");
     } catch (e) {
@@ -145,14 +53,12 @@ async function apiFetch(endpoint, method = "GET", body = null) {
     const options = {
         method,
         headers: {
-            "Authorization": `Bearer ${API_TOKEN}`,
             "Content-Type": "application/json"
         }
     };
     if (body) options.body = JSON.stringify(body);
     
     const resp = await fetch(endpoint, options);
-    if (resp.status === 401) logout();
     return resp.json();
 }
 

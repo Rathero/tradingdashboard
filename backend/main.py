@@ -11,23 +11,19 @@ except RuntimeError:
 import json
 import logging
 import os
-import uuid
+
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any, Optional
 
 import uvicorn
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Depends, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel
-
 import config
 import database as db
-from core.auth import get_password_hash, verify_password, create_access_token, get_current_user
 from core.session_manager import session_manager
 from signal_processor import parse_signal
 from order_manager import OrderManager
@@ -43,14 +39,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("ib_insync").setLevel(logging.WARNING)
 
-# ─── Models ────────────────────────────────────────────────────────────────────
-class UserRegister(BaseModel):
-    username: str
-    password: str
+# ─── ID fijo (anónimo, sin login) ──────────────────────────────────────────────
+USER_ID = 1
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
+def ensure_anonymous_user():
+    """Crea la fila anónima en BD si no existe (id=1)."""
+    import uuid as _uuid
+    conn = db.get_db()
+    row = conn.execute("SELECT id FROM users WHERE id=1").fetchone()
+    if not row:
+        now = __import__('datetime').datetime.utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO users (id, username, password_hash, webhook_secret, broker_type, broker_config, created_at) VALUES (?,?,?,?,?,?,?)",
+            (1, "anon", "-", str(_uuid.uuid4())[:18], "ibkr", "{}", now)
+        )
+        # Inicializar config de riesgo
+        rc = config.DEFAULT_RISK_CONFIG
+        conn.execute(
+            "INSERT OR IGNORE INTO risk_config (user_id, risk_per_trade_pct, max_daily_loss_pct, max_open_positions, default_stop_loss_pct, default_take_profit_pct, max_position_size_pct, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (1, rc['risk_per_trade_pct'], rc['max_daily_loss_pct'], rc['max_open_positions'], rc['default_stop_loss_pct'], rc['default_take_profit_pct'], rc['max_position_size_pct'], now)
+        )
+        conn.commit()
+        logger.info("🟢 Usuario anónimo creado (id=1)")
+    conn.close()
 
 # ─── WebSocket Manager ─────────────────────────────────────────────────────────
 class ConnectionManager:
@@ -83,31 +94,27 @@ manager = ConnectionManager()
 
 # ─── Background Tasks ──────────────────────────────────────────────────────────
 async def push_live_updates():
-    """Actualiza datos para todos los usuarios activos cada 5 segundos."""
+    """Actualiza datos cada 5 segundos."""
     while True:
         await asyncio.sleep(5)
-        users = db.get_active_users()
-        for user in users:
-            uid = user['id']
-            try:
-                broker = await session_manager.get_broker(uid)
-                if not broker or not broker.is_connected(): continue
+        try:
+            broker = await session_manager.get_broker(USER_ID)
+            if not broker or not broker.is_connected(): continue
 
-                acc = await broker.get_account_summary()
-                pos = await broker.get_positions()
-                
-                # Sincronizar P&L en BD (Simplificado)
-                today = date.today().isoformat()
-                db.upsert_daily_pnl(uid, today, acc.get("realized_pnl", 0), acc.get("unrealized_pnl", 0), 0, 0)
+            acc = await broker.get_account_summary()
+            pos = await broker.get_positions()
+            
+            today = date.today().isoformat()
+            db.upsert_daily_pnl(USER_ID, today, acc.get("realized_pnl", 0), acc.get("unrealized_pnl", 0), 0, 0)
 
-                await manager.send_to_user(uid, {
-                    "type": "live_update",
-                    "account": acc,
-                    "positions": pos,
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-            except Exception as e:
-                logger.debug(f"Error update usuario {uid}: {e}")
+            await manager.send_to_user(USER_ID, {
+                "type": "live_update",
+                "account": acc,
+                "positions": pos,
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        except Exception as e:
+            logger.debug(f"Error update: {e}")
 
 # ─── Lifecycle ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -119,66 +126,41 @@ async def lifespan(app: FastAPI):
     
     logger.info("🚀 Iniciando Trading Bot...")
     db.init_db()
+    ensure_anonymous_user()
     task = asyncio.create_task(push_live_updates())
     yield
     task.cancel()
     await session_manager.close_all()
 
-app = FastAPI(title="Trading SaaS API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Trading Bot API", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ─── Auth Endpoints ────────────────────────────────────────────────────────────
-@app.post("/auth/register")
-async def register(user_data: UserRegister):
-    if db.get_user_by_username(user_data.username):
-        raise HTTPException(status_code=400, detail="El usuario ya existe")
-    
-    secret = str(uuid.uuid4())[:18]
-    uid = db.create_user(
-        username=user_data.username,
-        password_hash=get_password_hash(user_data.password),
-        webhook_secret=secret
-    )
-    return {"message": "Usuario creado", "webhook_secret": secret}
-
-@app.post("/auth/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = db.get_user_by_username(form_data.username)
-    if not user or not verify_password(form_data.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
-    
-    access_token = create_access_token(data={"sub": user["username"]})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.get("/auth/me")
-async def get_me(user: dict = Depends(get_current_user)):
-    return {"id": user["id"], "username": user["username"], "webhook_secret": user["webhook_secret"]}
+# ─── Info ──────────────────────────────────────────────────────────────────────
+@app.get("/info")
+async def get_info():
+    conn = db.get_db()
+    row = conn.execute("SELECT webhook_secret FROM users WHERE id=1").fetchone()
+    conn.close()
+    return {"webhook_secret": row["webhook_secret"] if row else ""}
 
 # ─── Webhook ───────────────────────────────────────────────────────────────────
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     payload = await request.json()
-    secret = payload.get("secret")
-    user = db.get_user_by_secret(secret)
-    if not user:
-        raise HTTPException(status_code=403, detail="Webhook secret inválido")
 
     valid, msg, signal = parse_signal(payload)
     if not valid:
-        db.save_signal(user["id"], "UNKNOWN", "REJECTED", payload, status="error", error=msg)
+        db.save_signal(USER_ID, "UNKNOWN", "REJECTED", payload, status="error", error=msg)
         raise HTTPException(status_code=400, detail=msg)
 
-    # Iniciar procesamiento
-    broker = await session_manager.get_broker(user["id"])
-    notifier = await session_manager.get_notifier(user["id"])
-    risk = RiskManager(user["id"])
+    broker = await session_manager.get_broker(USER_ID)
+    notifier = await session_manager.get_notifier(USER_ID)
+    risk = RiskManager(USER_ID)
     
-    om = OrderManager(user["id"], broker, notifier, risk)
+    om = OrderManager(USER_ID, broker, notifier, risk)
     async def process_and_notify():
-        # Procesar señal en el broker
         result = await om.process_signal(signal)
         
-        # Generar tip y notificar a Telegram
         tip = await generate_trading_tip(signal.get('symbol', ''), signal.get('action', ''))
         telegram_msg = (
             f"📨 <b>Señal recibida</b>\n"
@@ -190,8 +172,7 @@ async def receive_webhook(request: Request):
             telegram_msg += f"\n\n💡 <b>Tip del Portfolio Manager:</b>\n{tip}"
         await notifier.send_message(telegram_msg)
 
-        # Notificar al dashboard web
-        await manager.send_to_user(user["id"], {
+        await manager.send_to_user(USER_ID, {
             "type": "new_signal",
             "symbol": signal.get("symbol", ""),
             "action": signal.get("action", ""),
@@ -199,10 +180,8 @@ async def receive_webhook(request: Request):
             "timestamp": datetime.utcnow().isoformat()
         })
 
-    # Iniciar procesamiento en background
     asyncio.create_task(process_and_notify())
-    
-    return {"status": "processing", "user": user["username"]}
+    return {"status": "processing"}
 
 
 # ─── Estado del Bot ────────────────────────────────────────────────────────────
@@ -255,41 +234,40 @@ async def cancel_all():
 
 # ─── Cuenta ────────────────────────────────────────────────────────────────────
 @app.get("/account")
-async def get_account(user: dict = Depends(get_current_user)):
-    broker = await session_manager.get_broker(user["id"])
+async def get_account():
+    broker = await session_manager.get_broker(USER_ID)
     if not broker or not broker.is_connected():
         return {"connected": False}
     return await broker.get_account_summary()
 
 @app.get("/positions")
-async def get_positions(user: dict = Depends(get_current_user)):
-    broker = await session_manager.get_broker(user["id"])
+async def get_positions():
+    broker = await session_manager.get_broker(USER_ID)
     return await broker.get_positions() if broker else []
 
 @app.get("/trades")
-async def get_trades(user: dict = Depends(get_current_user)):
-    return db.get_trades(user["id"])
+async def get_trades():
+    return db.get_trades(USER_ID)
 
 @app.get("/config/risk")
-async def get_risk(user: dict = Depends(get_current_user)):
-    return db.get_risk_config(user["id"])
+async def get_risk():
+    return db.get_risk_config(USER_ID)
 
 @app.put("/config/broker")
-async def update_broker_config(data: dict, user: dict = Depends(get_current_user)):
-    """Actualiza la configuración del broker del usuario."""
+async def update_broker_config(data: dict):
+    """Actualiza la configuración del broker."""
     broker_type = data.get("broker_type")
     broker_config = data.get("broker_config")
     
     conn = db.get_db()
     conn.execute(
         "UPDATE users SET broker_type=?, broker_config=? WHERE id=?",
-        (broker_type, json.dumps(broker_config), user["id"])
+        (broker_type, json.dumps(broker_config), USER_ID)
     )
     conn.commit()
     conn.close()
     
-    # Reiniciar sesión para aplicar cambios
-    await session_manager._init_session(user["id"])
+    await session_manager._init_session(USER_ID)
     return {"success": True}
 
 # ─── Frontend & Static ─────────────────────────────────────────────────────────
@@ -304,16 +282,13 @@ async def index():
 
 # ─── WebSocket Endpoints ───────────────────────────────────────────────────────
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = None):
-    # En producción usaríamos el token para autenticar
-    # Mock user_id 1 por ahora para pruebas de frontend iniciales
-    uid = 1 
-    await manager.connect(uid, websocket)
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(USER_ID, websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(uid, websocket)
+        manager.disconnect(USER_ID, websocket)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000)
